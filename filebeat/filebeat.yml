@@ -1,0 +1,23 @@
+filebeat.inputs:
+  - type: container
+    paths:
+      - /var/lib/docker/containers/*/*.log
+
+processors:
+  - add_docker_metadata:
+      host: "unix:///var/run/docker.sock"
+
+# Ship to Logstash (private network) rather than Elasticsearch directly,
+# so events pass through the filter pipeline.
+output.logstash:
+  hosts: ["logstash:5044"]
+
+# Alternative: ship straight to Elasticsearch, bypassing Logstash.
+# output.elasticsearch:
+#   hosts: ["https://elasticsearch:9200"]
+#   username: "filebeat_internal"
+#   password: "${FILEBEAT_INTERNAL_PASSWORD}"
+#   ssl.certificate_authorities: ["/usr/share/filebeat/certs/ca/ca.crt"]
+
+logging.json: true
+logging.metrics.enabled: false
