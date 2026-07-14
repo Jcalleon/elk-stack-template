@@ -1,0 +1,161 @@
+name: elk-stack
+
+# =============================================================================
+# Shared config applied to every ELK service, so grouping/network/logging
+# rules live in one place instead of being repeated per service.
+# =============================================================================
+x-elk-common: &elk-common
+  networks:
+    - elk-private
+  restart: unless-stopped
+  labels:
+    com.elk-stack.group: "elk"
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+networks:
+  # Dedicated, non-default bridge network. Only containers attached to it
+  # can reach each other by service name; nothing outside this compose
+  # project can see this traffic.
+  elk-private:
+    name: elk-private
+    driver: bridge
+
+volumes:
+  certs:
+  elasticsearch-data:
+
+services:
+
+  # ---------------------------------------------------------------------
+  # Setup: one-shot job that generates the CA + TLS certs and bootstraps
+  # built-in user passwords. Everything else waits for it to finish.
+  # ---------------------------------------------------------------------
+  setup:
+    <<: *elk-common
+    build:
+      context: setup/
+      args:
+        STACK_VERSION: ${STACK_VERSION}
+    container_name: elk-setup
+    init: true
+    volumes:
+      - certs:/usr/share/elasticsearch/config/certs
+    environment:
+      ELASTIC_PASSWORD: ${ELASTIC_PASSWORD}
+      KIBANA_PASSWORD: ${KIBANA_PASSWORD}
+      LOGSTASH_INTERNAL_PASSWORD: ${LOGSTASH_INTERNAL_PASSWORD}
+      FILEBEAT_INTERNAL_PASSWORD: ${FILEBEAT_INTERNAL_PASSWORD}
+    restart: "no"
+
+  # ---------------------------------------------------------------------
+  # Elasticsearch
+  # ---------------------------------------------------------------------
+  elasticsearch:
+    <<: *elk-common
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    image: docker.elastic.co/elasticsearch/elasticsearch:${STACK_VERSION}
+    container_name: elasticsearch
+    volumes:
+      - certs:/usr/share/elasticsearch/config/certs
+      - elasticsearch-data:/usr/share/elasticsearch/data
+      - ./elasticsearch/config/elasticsearch.yml:/usr/share/elasticsearch/config/elasticsearch.yml:ro
+    environment:
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+      ELASTIC_PASSWORD: ${ELASTIC_PASSWORD}
+      ES_CLUSTER_NAME: ${ES_CLUSTER_NAME}
+      LICENSE: ${LICENSE}
+    # Not exposed to the host by default -- stays on the private network.
+    # Uncomment to debug locally:
+    # ports:
+    #   - "${ES_PORT}:9200"
+    mem_limit: ${ES_MEM_LIMIT}
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -s --cacert config/certs/ca/ca.crt https://localhost:9200 | grep -q 'missing authentication credentials'",
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+
+  # ---------------------------------------------------------------------
+  # Logstash
+  # ---------------------------------------------------------------------
+  logstash:
+    <<: *elk-common
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    image: docker.elastic.co/logstash/logstash:${STACK_VERSION}
+    container_name: logstash
+    volumes:
+      - certs:/usr/share/logstash/config/certs:ro
+      - ./logstash/config/logstash.yml:/usr/share/logstash/config/logstash.yml:ro
+      - ./logstash/pipeline:/usr/share/logstash/pipeline:ro
+    environment:
+      LS_JAVA_OPTS: "-Xms512m -Xmx512m"
+      LOGSTASH_INTERNAL_PASSWORD: ${LOGSTASH_INTERNAL_PASSWORD}
+    # Beats input is only reachable from other containers on elk-private
+    # (e.g. filebeat). Expose to host only if you have external shippers.
+    # ports:
+    #   - "${LOGSTASH_BEATS_PORT}:5044"
+    mem_limit: ${LS_MEM_LIMIT}
+
+  # ---------------------------------------------------------------------
+  # Kibana
+  # ---------------------------------------------------------------------
+  kibana:
+    <<: *elk-common
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    image: docker.elastic.co/kibana/kibana:${STACK_VERSION}
+    container_name: kibana
+    volumes:
+      - certs:/usr/share/kibana/config/certs:ro
+      - ./kibana/config/kibana.yml:/usr/share/kibana/config/kibana.yml:ro
+    environment:
+      KIBANA_PASSWORD: ${KIBANA_PASSWORD}
+      KIBANA_ENCRYPTION_KEY: ${KIBANA_ENCRYPTION_KEY}
+    # Kibana is the one UI-facing service, so it's the only port published
+    # to the host; everything else stays inside elk-private.
+    ports:
+      - "${KIBANA_PORT}:5601"
+    mem_limit: ${KB_MEM_LIMIT}
+    healthcheck:
+      test:
+        ["CMD-SHELL", "curl -s -I http://localhost:5601 | grep -q 'HTTP/1.1'"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+
+  # ---------------------------------------------------------------------
+  # Filebeat: ships container logs into Logstash over the private network.
+  # ---------------------------------------------------------------------
+  filebeat:
+    <<: *elk-common
+    depends_on:
+      logstash:
+        condition: service_started
+    image: docker.elastic.co/beats/filebeat:${STACK_VERSION}
+    container_name: filebeat
+    user: root
+    volumes:
+      - certs:/usr/share/filebeat/certs:ro
+      - ./filebeat/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      FILEBEAT_INTERNAL_PASSWORD: ${FILEBEAT_INTERNAL_PASSWORD}
+    command: ["--strict.perms=false"]
